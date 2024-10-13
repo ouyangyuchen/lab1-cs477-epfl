@@ -317,7 +317,37 @@ int bpf_redirect_roundrobin(struct xdp_md *ctx)
 	}
 
 	// TODO: make redirection decision
-	return XDP_DROP;
+	cpu_iterator = bpf_map_lookup_elem(&cpu_iter, &key0);
+	if (!cpu_iterator) {
+		bpf_printk("map lookup failure: cpu_iterator is NULL");
+		return XDP_DROP;
+	}
+
+	cpu_count = bpf_map_lookup_elem(&cpus_count, &key0);
+	if (!cpu_count) {
+		bpf_printk("map lookup failure: cpu_count is NULL");
+		return XDP_DROP;
+	}
+	*cpu_iterator = *cpu_iterator % *cpu_count;
+	cpu_dest = *cpu_iterator;
+	*cpu_iterator += 1;
+
+	cpu_selected = bpf_map_lookup_elem(&cpus_available, &cpu_dest);
+	if (!cpu_selected) {
+		bpf_printk("map lookup failure: cpu_selected is NULL");
+		return XDP_DROP;
+	}
+	if (*cpu_selected == 0) {
+		bpf_printk("selected CPU is not available for processing");
+		return XDP_ABORTED;
+	}
+
+	int ret = bpf_redirect_map(&cpu_map, cpu_dest, 0);
+	if (ret != XDP_REDIRECT) {
+		bpf_printk("bpf_redirect_map failure: ret code = %d", ret);
+		return XDP_DROP;
+	}
+	return ret;
 }
 
 /* array of cpus available for processing long requests */
@@ -364,6 +394,7 @@ int bpf_redirect_roundrobin_core_separated(struct xdp_md *ctx)
 	__u32 key1 = 1;
 	__u32 cpu_idx;
 	__u64 *rx_ctr;
+	int request_type = 0;
 
 	rx_ctr = bpf_map_lookup_elem(&rx_packet_ctr, &key0);
 	if (rx_ctr)
@@ -377,7 +408,51 @@ int bpf_redirect_roundrobin_core_separated(struct xdp_md *ctx)
 		return XDP_PASS;
 
 	// TODO: make redirection decision
-	return XDP_DROP;
+	packet = (struct packet *)(nh.pos);
+	if (packet + 1 > data_end)
+		return XDP_DROP;
+	if (packet->data >= 10)
+		request_type = 1; // long
+	else
+		request_type = 0; // short
+
+	cpu_iterator_short = bpf_map_lookup_elem(&cpu_iter_core_separated, &key0);
+	if (!cpu_iterator_short)
+		return XDP_DROP;
+	cpu_iterator_long = bpf_map_lookup_elem(&cpu_iter_core_separated, &key1);
+	if (!cpu_iterator_long)
+		return XDP_DROP;
+	
+	cpu_count_short = bpf_map_lookup_elem(&cpu_count_core_separated, &key0);
+	if (!cpu_count_short)
+		return XDP_DROP;
+	cpu_count_long = bpf_map_lookup_elem(&cpu_count_core_separated, &key1);
+	if (!cpu_count_long)
+		return XDP_DROP;
+
+	if (request_type == 0) {
+		cpu_dest = (*cpu_iterator_short) % (*cpu_count_short);
+		*cpu_iterator_short += 1;
+		*cpu_iterator_short = *cpu_iterator_short % (*cpu_count_short);
+		cpu_selected = bpf_map_lookup_elem(&cpus_available_short_reqs, &cpu_dest);
+	} else {
+		cpu_dest = (*cpu_iterator_long) % (*cpu_count_long);
+		*cpu_iterator_long += 1;
+		*cpu_iterator_long = *cpu_iterator_long % (*cpu_count_long);
+		cpu_selected = bpf_map_lookup_elem(&cpus_available_long_reqs, &cpu_dest);
+
+		cpu_dest += *cpu_count_short;	// offset for long requests
+	}
+	if (!cpu_selected)
+		return XDP_DROP;
+
+	if (*cpu_selected == 0)
+		return XDP_ABORTED;
+
+	int ret = bpf_redirect_map(&cpu_map, cpu_dest, 0);
+	if (ret != XDP_REDIRECT)
+		return XDP_DROP;
+	return ret;
 }
 
 SEC("tc")
